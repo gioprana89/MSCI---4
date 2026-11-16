@@ -10,6 +10,8 @@ import streamlit as st
 from analysis_engine import (load_source, all_results, METADATA_WARNING, EVENT_DATE,
                              MAIN_END, VERSION, STATES)
 from exporter import research_zip, SHEET_NAMES
+from download_support import (CHUNK_BYTES, part_count, read_part, part_filename,
+                              sha256_file, windows_reassemble_batch)
 
 st.set_page_config(page_title="MSCI Article 2 · Quote States",page_icon="📊",layout="wide")
 st.markdown("""
@@ -39,6 +41,9 @@ if compute:
             raw, sha=load_source(io.BytesIO(uploaded.getvalue()))
         with st.spinner("Preparing all rows, quote states, transitions, FE models and forecasts..."):
             result=all_results(raw,sha,threshold=threshold,advanced=advanced)
+        # Prevent downloads from an earlier analysis run being reused accidentally.
+        for k in ("export_file", "export_excel"):
+            st.session_state.pop(k, None)
         st.session_state["research_result"]=result
         st.session_state["research_filename"]=uploaded.name
         st.success("Calculation completed. Please inspect the audit and model statuses.")
@@ -154,24 +159,82 @@ with tabs[6]:
 
 with tabs[7]:
     st.subheader("Audit-ready Excel and publication figures")
-    st.write(f"Workbook: **{len(SHEET_NAMES)} sheets** including all {len(raw):,} raw observations, processed data, flags, statistical formulas, model outputs, and embedded figures.")
-    st.dataframe(pd.DataFrame({"sheet":SHEET_NAMES}),use_container_width=True,hide_index=True)
-    st.warning("Export may be large: the original 30 columns and all additional processed features are included for every stock-date observation.")
-    if st.button("Build full Excel + Figures ZIP",type="primary",use_container_width=True):
-        with st.spinner("Writing full-source Excel, all derived rows, 6 actual-data figures and run manifest..."):
-            outdir=Path(tempfile.mkdtemp(prefix="msci_article2_"))
-            p,excel,figures=research_zip(r,outdir/"MSCI_Article2_Research_Output.zip",outdir)
-        st.session_state["export_file"] = str(p)
-        st.session_state["export_excel"] = str(excel)
-        st.success(f"Export complete: {p.stat().st_size/1024/1024:.1f} MB ZIP, {len(figures)} figures")
-    if st.session_state.get("export_file"):
-        path=Path(st.session_state["export_file"])
-        if path.exists():
-            with path.open("rb") as handle:
-                st.download_button("Download research ZIP (Excel + figures + manifest)",handle.read(),
-                     file_name=path.name,mime="application/zip",type="primary",use_container_width=True)
-            excel=Path(st.session_state["export_excel"])
-            if excel.exists():
-                with excel.open("rb") as handle:
-                    st.download_button("Download Excel workbook only",handle.read(),file_name=excel.name,
-                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+    st.write(f"Workbook: **{len(SHEET_NAMES)} sheets**, all {len(raw):,} source observations, processed values, model outputs and embedded figures.")
+    st.dataframe(pd.DataFrame({"sheet": SHEET_NAMES}), use_container_width=True, hide_index=True)
+    st.warning("Full export files can exceed 90 MB. If one-click download is blocked, use the 12 MB fallback parts below.")
+    if st.button("Build full Excel + Figures ZIP", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Building all 17 worksheets, 6 figures and run manifest..."):
+                outdir = Path(tempfile.mkdtemp(prefix="msci_article2_"))
+                p, excel, figures = research_zip(r, outdir / "MSCI_Article2_Research_Output.zip", outdir)
+            if not p.exists() or not excel.exists():
+                raise FileNotFoundError("Export routine did not write both expected files")
+            st.session_state["export_file"] = str(p)
+            st.session_state["export_excel"] = str(excel)
+            st.success(f"Export complete: ZIP {p.stat().st_size/2**20:.1f} MB, Excel {excel.stat().st_size/2**20:.1f} MB, {len(figures)} figures.")
+        except Exception as exc:
+            st.session_state.pop("export_file", None)
+            st.session_state.pop("export_excel", None)
+            st.error(f"Export failed: {type(exc).__name__}: {exc}")
+            st.stop()
+
+    zip_path = Path(st.session_state.get("export_file", "__file_not_built__"))
+    excel_path = Path(st.session_state.get("export_excel", "__file_not_built__"))
+    if not zip_path.is_file() or not excel_path.is_file():
+        st.info("Click **Build full Excel + Figures ZIP** above first. When finished, the download controls appear below.")
+    else:
+        st.success(f"Ready on server: ZIP {zip_path.stat().st_size / 2**20:.1f} MB and Excel {excel_path.stat().st_size / 2**20:.1f} MB.")
+        st.markdown("**Step 1 — Test browser download (small file)**")
+        test_bytes = ("MSCI Article 2 download diagnostic OK.\n" * 30).encode("utf-8")
+        st.download_button("Test download (1 KB)", data=test_bytes,
+                           file_name="MSCI_Download_Test.txt", mime="text/plain",
+                           use_container_width=True, key="gatec_test_download")
+        st.caption("If even the 1 KB test fails, check the browser Downloads list (Ctrl+J) and site download permissions. If the test works but large files do not, try fallback parts.")
+
+        st.markdown("**Step 2 — Direct download (one large file)**")
+        chosen_direct = st.radio("Select full export", ["ZIP package", "Excel workbook"],
+                                 key="gatec_direct_choice", horizontal=True)
+        chosen_path = zip_path if chosen_direct == "ZIP package" else excel_path
+        large_mime = "application/zip" if chosen_direct == "ZIP package" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        st.info(f"Direct file size: {chosen_path.stat().st_size / 2**20:.1f} MB. Click 'Enable large-file download' to load this one file into Streamlit memory.")
+        if st.checkbox("Enable large-file download (high memory usage)", value=False,
+                       key="gatec_large_download_enabled"):
+            with chosen_path.open("rb") as f:
+                st.download_button(f"Download {chosen_direct} — {chosen_path.stat().st_size / 2**20:.1f} MB",
+                                   data=f.read(), file_name=chosen_path.name, mime=large_mime,
+                                   use_container_width=True, key="gatec_large_download")
+
+        st.markdown("**Step 3 — Reliable fallback: download parts (12 MB each)**")
+        st.caption("The fallback does not change the Excel/ZIP content. Download every part and the small reconstruction script into the SAME Windows folder.")
+        fallback_type = st.radio("Which file should be split?", ["ZIP package", "Excel workbook"],
+                                 key="gatec_fallback_choice", horizontal=True)
+        fallback_path = zip_path if fallback_type == "ZIP package" else excel_path
+        n_parts = part_count(fallback_path, CHUNK_BYTES)
+        part_number = st.selectbox("Choose part to download", list(range(1, n_parts+1)),
+                                   format_func=lambda i: f"Part {i:02d} of {n_parts:02d}",
+                                   key="gatec_part_number")
+        this_part = read_part(fallback_path, part_number-1, CHUNK_BYTES)
+        st.download_button(f"Download part {part_number}/{n_parts} ({len(this_part)/2**20:.1f} MB)",
+                           data=this_part, file_name=part_filename(fallback_path, part_number-1),
+                           mime="application/octet-stream", use_container_width=True,
+                           key="gatec_download_part")
+        with st.expander("Instructions to recombine the parts on Windows"):
+            st.markdown("1. Download parts **1 through " + str(n_parts) + "** using the selector above.\n"
+                        "2. Download the .bat script below.\n"
+                        "3. Put the downloaded parts and .bat in the same folder.\n"
+                        "4. Double-click the .bat. It will combine all parts into the original file, then display an SHA-256 hash for comparison.\n"
+                        "5. Open the resulting .zip or .xlsx as usual. Keep the window open to inspect any error.")
+        if st.button("Prepare Windows reassembly instructions", key="gatec_prepare_hash"):
+            st.session_state["gatec_hash_path"] = str(fallback_path)
+            st.session_state["gatec_hash"] = sha256_file(fallback_path)
+        if st.session_state.get("gatec_hash_path") == str(fallback_path):
+            digest = st.session_state["gatec_hash"]
+            batch = windows_reassemble_batch(fallback_path, digest, CHUNK_BYTES)
+            st.download_button("Download reassembly script (.bat, small file)",
+                               data=batch, file_name=f"REASSEMBLE_{fallback_path.name}.bat",
+                               mime="application/octet-stream", use_container_width=True,
+                               key="gatec_download_batch")
+            st.code(f"Expected SHA-256: {digest}")
+            st.caption("This script uses the built-in Windows copy and certutil commands. Run only a script downloaded from your own application.")
+        else:
+            st.caption("Click 'Prepare Windows reassembly instructions' to generate the small reconstruction script and file integrity hash.")

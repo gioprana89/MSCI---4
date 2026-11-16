@@ -65,3 +65,15 @@ The tests expect the original source at `../Ringkasan_Saham_Gabungan.xlsx` or se
 
 ## Gate D correction (v1.0.1)
 Sample prediction now requires next_date<=10 Nov 2026. This excludes 842 t=10 Nov cases whose next-day outcomes are 11 Nov; corrected M2 estimates are provided separately in Gate D audit. Regenerate 17-sheet workbook from this version before manuscript finalization.
+
+## Gate D v1.0.2 — reliable large downloads (16 November 2026)
+
+The old Export tab showed two large download buttons immediately after building the workbook. This could force Streamlit to read ~100 MB ZIP and ~100 MB XLSX into application memory together, and downloads could silently fail if the server or browser was resource constrained. This update retains the original 17-sheet XLSX content, including all source observations and analysis results, and changes only the delivery workflow:
+
+1. Upload `Ringkasan_Saham_Gabungan.xlsx`, run full analysis, and enter tab 8.
+2. Click **Build full Excel + Figures ZIP** and wait until **Ready on server** appears.
+3. Click **Test download (1 KB)**. If this fails, check Edge/Chrome Downloads (Ctrl+J), site permissions, or the hosting server.
+4. If that works, select **ZIP package** or **Excel workbook**, enable large-file download, and use the direct button.
+5. If full-file download fails, use **Reliable fallback**. Download each of the sequential 12 MiB parts by choosing Part 01, Part 02, ... in the drop-down; click **Prepare Windows reassembly instructions**; download the small `.bat` file; put all parts and `.bat` in the same folder; double-click the `.bat` to restore exactly the original file. Confirm the printed SHA256 hash matches the expected value in the app.
+
+The fallback neither omits analyses nor changes values. It streams only one ~12 MiB part into Streamlit memory per button interaction, instead of both ~100 MiB files. Re-run the application after replacing the previous code folder; the old built exports are in the previous Streamlit server session and may need rebuilding.
